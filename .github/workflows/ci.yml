@@ -1,0 +1,52 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RUSTDOCFLAGS: -D warnings
+      PROPTEST_CASES: 1024
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo run --locked -p private-fs-windows-bindings -- --check
+      - run: git diff --exit-code -- src/windows/bindings.rs
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo doc --locked --workspace --no-deps --all-features
+      - run: cargo bench --locked --bench filesystem -- --test
+      - name: Forced Linux descriptor walk, including publication and stress
+        if: runner.os == 'Linux'
+        run: cargo test --locked --workspace --features force-walk
+      - name: Forced Linux descriptor-walk benchmarks
+        if: runner.os == 'Linux'
+        run: cargo bench --locked --bench filesystem --features force-walk -- --test
+      - name: Real macOS ACL and ownership runtime tests (never cross-compiled)
+        if: runner.os == 'macOS'
+        run: cargo test --locked --lib macos::tests:: -- --test-threads=1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Library MSRV, excluding the Rust 1.95 binding-generator tool
+        run: cargo +1.88.0 test --locked -p private-fs --all-features
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
