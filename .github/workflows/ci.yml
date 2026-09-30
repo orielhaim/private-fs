@@ -36,7 +36,7 @@ jobs:
         run: cargo bench --locked --bench filesystem --features force-walk -- --test
       - name: Real macOS ACL and ownership runtime tests (never cross-compiled)
         if: runner.os == 'macOS'
-        run: cargo test --locked --lib macos::tests:: -- --test-threads=1
+        run: "cargo test --locked --lib macos::tests:: -- --test-threads=1"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
