@@ -894,12 +894,16 @@ fn an_open_reader_survives_replacement_without_partial_contents() {
     );
 }
 #[test]
-fn non_unicode_target_names_remain_lossless() {
-    #[cfg(unix)]
+fn native_target_names_are_preserved_without_lossy_conversion() {
+    #[cfg(target_os = "linux")]
     let name = {
         use std::os::unix::ffi::OsStringExt;
         OsString::from_vec(vec![b'k', 0xff])
     };
+    // Darwin filesystems such as APFS reject invalid UTF-8 at rename. Exercise
+    // accepted non-ASCII names here; raw-byte rejection has its own security test.
+    #[cfg(target_os = "macos")]
+    let name = OsString::from("k\u{00e9}\u{96ea}");
     #[cfg(windows)]
     let name = {
         use std::os::windows::ffi::OsStringExt;
@@ -912,4 +916,48 @@ fn non_unicode_target_names_remain_lossless() {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"second");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn invalid_utf8_publication_propagates_error_and_retains_private_staging() {
+    use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
+    let invalid = OsString::from_vec(vec![b'k', 0xff]);
+    let (root, dir) = fixture();
+    dir.write_atomic("sentinel", b"untouched").unwrap();
+    let mut writer = dir.atomic(&invalid).unwrap();
+    writer.write_all(b"secret").unwrap();
+    let temp_name = writer.name.clone().unwrap();
+    let original = writer.temp.raw_file().try_clone().unwrap();
+    assert!(matches!(writer.commit(),
+        Err(Error::AtomicCommit { may_have_published: true, source })
+            if matches!(*source, Error::Io(ref e) if e.raw_os_error() == Some(libc::EILSEQ))));
+    // Publication failure is conservatively ambiguous. Never remove the named
+    // Unix temp, silently convert the destination, or modify another entry.
+    crate::verify(&original).unwrap();
+    let mut staged = dir.open_file(&temp_name).unwrap();
+    let original_id = original.metadata().unwrap();
+    let retained_id = staged.raw_file().metadata().unwrap();
+    assert_eq!(
+        (retained_id.dev(), retained_id.ino()),
+        (original_id.dev(), original_id.ino())
+    );
+    let mut bytes = Vec::new();
+    staged.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"secret");
+    assert_eq!(
+        std::fs::read(root.path().join("private/sentinel")).unwrap(),
+        b"untouched"
+    );
+    let mut actual: Vec<_> = std::fs::read_dir(root.path().join("private"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    actual.sort();
+    let mut expected = vec![temp_name, OsString::from("sentinel")];
+    expected.sort();
+    assert_eq!(actual, expected);
+    // A fresh accepted-name transaction remains usable after the failed commit.
+    dir.write_atomic("retry", b"complete").unwrap();
+    dir.open_file("retry").unwrap().verify().unwrap();
 }

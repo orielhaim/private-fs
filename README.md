@@ -6,7 +6,7 @@ Files and directories are private from creation. Operations stay bound to valida
 
 See [`SECURITY.md`](SECURITY.md) for the full security contract
 
-```rust
+```rust,no_run
 use private_fs::PrivateDir;
 use std::io::Write;
 
@@ -35,22 +35,30 @@ The crate:
 
 Existing objects are never hardened implicitly.
 
-```rust
+```rust,no_run
+use private_fs::PrivateDir;
+
 let dir = PrivateDir::open("app-private")?;
 let file = dir.open_file("token")?;
 
 file.verify()?;
 file.harden()?;
+# Ok::<(), private_fs::Error>(())
 ```
 
 ## Atomic writes
 
-```rust
+```rust,no_run
+use private_fs::PrivateDir;
+use std::io::Write;
+
+let dir = PrivateDir::open("app-private")?;
 let mut writer = dir.atomic("state.json")?;
 writer.write_all(b"new state")?;
 writer.commit()?;
 
 dir.write_atomic_durable("state.json", b"durable state")?;
+# Ok::<(), private_fs::Error>(())
 ```
 
 Atomic writes stage privately in the same validated directory, publish relative to the directory capability, then verify the published object's identity and security state.

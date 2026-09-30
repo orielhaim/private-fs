@@ -19,7 +19,11 @@ Do not give an untrusted same-principal actor write access to a private tree.
   No extra SYSTEM or administrator grant is inserted.
 - Relative paths reject roots, prefixes, traversal, interior dots, NULs, and colons
   (including Windows alternate streams). Unix also rejects backslashes. Native
-  non-Unicode names are preserved. Windows NT names are not normalized to Win32
+  names are passed without lossy Unicode conversion; filesystem encoding rules
+  still apply. [APFS requires valid UTF-8 filenames](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html),
+  so invalid Unix byte names can fail with `EILSEQ`, including during publication.
+  The original filesystem error is propagated without renaming to a substitute.
+  Windows NT names are not normalized to Win32
   spelling conventions; callers should use the capability for subsequent access.
 - Children are resolved through retained directory descriptors/handles. Redirects
   are rejected, including Linux magic links and Windows reparse points. Linux uses
