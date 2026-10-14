@@ -55,9 +55,12 @@ pub struct ACL {
 }
 pub const ACL_REVISION: i32 = 2;
 pub type BOOL = i32;
+pub type CCHAR = i8;
 pub const CONTAINER_INHERIT_ACE: i32 = 2;
 pub const DACL_SECURITY_INFORMATION: i32 = 4;
+pub const DELETE: i32 = 65536;
 pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+pub const ERROR_NO_MORE_FILES: i32 = 18;
 pub const FILE_ALL_ACCESS: i32 = 2032127;
 pub const FILE_ATTRIBUTE_DIRECTORY: i32 = 16;
 pub const FILE_ATTRIBUTE_NORMAL: i32 = 128;
@@ -86,6 +89,30 @@ impl Default for FILE_ID_128 {
     }
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FILE_ID_BOTH_DIR_INFO {
+    pub NextEntryOffset: u32,
+    pub FileIndex: u32,
+    pub CreationTime: i64,
+    pub LastAccessTime: i64,
+    pub LastWriteTime: i64,
+    pub ChangeTime: i64,
+    pub EndOfFile: i64,
+    pub AllocationSize: i64,
+    pub FileAttributes: u32,
+    pub FileNameLength: u32,
+    pub EaSize: u32,
+    pub ShortNameLength: CCHAR,
+    pub ShortName: [u16; 12],
+    pub FileId: i64,
+    pub FileName: [u16; 1],
+}
+impl Default for FILE_ID_BOTH_DIR_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FILE_ID_INFO {
     pub VolumeSerialNumber: u64,
@@ -93,6 +120,7 @@ pub struct FILE_ID_INFO {
 }
 pub type FILE_INFORMATION_CLASS = i32;
 pub type FILE_INFO_BY_HANDLE_CLASS = i32;
+pub const FILE_LIST_DIRECTORY: i32 = 1;
 pub const FILE_NON_DIRECTORY_FILE: i32 = 64;
 pub const FILE_OPEN: i32 = 1;
 pub const FILE_OPEN_IF: i32 = 3;
@@ -144,6 +172,8 @@ pub const FILE_WRITE_DATA: i32 = 2;
 pub const FSCTL_SET_REPARSE_POINT: i32 = 589988;
 pub const FileAttributeTagInfo: FILE_INFO_BY_HANDLE_CLASS = 9;
 pub const FileDispositionInfo: FILE_INFO_BY_HANDLE_CLASS = 4;
+pub const FileIdBothDirectoryInfo: FILE_INFO_BY_HANDLE_CLASS = 10;
+pub const FileIdBothDirectoryRestartInfo: FILE_INFO_BY_HANDLE_CLASS = 11;
 pub const FileIdInfo: FILE_INFO_BY_HANDLE_CLASS = 18;
 pub const FileRenameInformation: FILE_INFORMATION_CLASS = 10;
 pub const FileRenameInformationEx: FILE_INFORMATION_CLASS = 65;

@@ -1,4 +1,7 @@
-use crate::{Error, Result, path::RelativePath};
+use crate::{
+    Durability, Error, FileAccess, FileCreation, OpenOptions, Result, Verification,
+    path::RelativePath,
+};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use std::{
     ffi::OsStr,
@@ -10,15 +13,12 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
-    dev: u64,
+    dev: fs::Dev,
     ino: u64,
 }
 fn identity(s: &fs::Stat) -> Identity {
     Identity {
-        #[cfg(target_os = "linux")]
         dev: s.st_dev,
-        #[cfg(target_os = "macos")]
-        dev: u64::from(s.st_dev as u32),
         ino: s.st_ino,
     }
 }
@@ -26,7 +26,9 @@ fn creation_parent(fd: impl AsFd) -> Result<()> {
     let stat = fs::fstat(fd.as_fd())?;
     creation_parent_stat(&stat)?;
     #[cfg(target_os = "macos")]
-    crate::macos::creation_parent(fd)?;
+    crate::macos::creation_parent(fd.as_fd())?;
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    crate::bsd::creation_parent(fd)?;
     Ok(())
 }
 fn creation_parent_stat(stat: &fs::Stat) -> Result<()> {
@@ -64,6 +66,7 @@ pub struct PrivateFile {
     file: File,
     id: Identity,
     links: u64,
+    verification: Verification,
 }
 
 fn permission_error(expected: impl Into<u32>, actual: impl Into<u32>) -> Error {
@@ -94,7 +97,9 @@ fn validate_links(
     let s = fs::fstat(fd.as_fd())?;
     let id = validate_stat_links(&s, directory, expected_id, links)?;
     #[cfg(target_os = "macos")]
-    crate::macos::verify_acl(fd)?;
+    crate::macos::verify_acl(fd.as_fd())?;
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    crate::bsd::verify(fd.as_fd(), directory)?;
     Ok(id)
 }
 fn validate_stat(s: &fs::Stat, directory: bool, expected_id: Option<Identity>) -> Result<Identity> {
@@ -189,6 +194,8 @@ fn open_component(
     resolver: Resolver,
 ) -> Result<OwnedFd> {
     let flags = flags | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    #[cfg(target_os = "freebsd")]
+    let flags = flags | OFlags::from_bits_retain(libc::O_RESOLVE_BENEATH as u32);
     #[cfg(target_os = "linux")]
     if let Some(fd) = open_fast(parent.as_fd(), name, flags, mode, resolver)? {
         return Ok(fd);
@@ -199,6 +206,10 @@ fn open_component(
     match fs::openat(parent.as_fd(), name, flags, mode) {
         Ok(fd) => Ok(fd),
         Err(e) => {
+            #[cfg(target_os = "freebsd")]
+            if e == rustix::io::Errno::MLINK {
+                return Err(Error::PathRedirect);
+            }
             if e == rustix::io::Errno::NOTDIR
                 && fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
                     .is_ok_and(|s| FileType::from_raw_mode(s.st_mode) == FileType::Symlink)
@@ -210,9 +221,27 @@ fn open_component(
         }
     }
 }
+fn open_existing_file(
+    parent: impl AsFd,
+    name: &OsStr,
+    flags: OFlags,
+    resolver: Resolver,
+) -> Result<(OwnedFd, Identity)> {
+    let observed = fs::statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+    match FileType::from_raw_mode(observed.st_mode) {
+        FileType::Symlink => return Err(Error::PathRedirect),
+        FileType::RegularFile => (),
+        _ => return Err(Error::WrongObjectKind),
+    }
+    let fd = open_component(parent, name, flags, Mode::empty(), resolver)?;
+    let id = validate(&fd, false, Some(identity(&observed)))?;
+    Ok((fd, id))
+}
 fn normalize_created(fd: impl AsFd, directory: bool, id: Identity) -> Result<()> {
     #[cfg(target_os = "macos")]
     crate::macos::verify(fd.as_fd())?;
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    crate::bsd::verify(fd.as_fd(), directory)?;
     let s = fs::fstat(fd.as_fd())?;
     let expected = if directory { 0o700 } else { 0o600 };
     let actual = s.st_mode & 0o7777;
@@ -239,6 +268,8 @@ fn harden(fd: impl AsFd, directory: bool, id: Identity) -> Result<()> {
     fs::fchmod(fd.as_fd(), Mode::from_raw_mode(mode))?;
     #[cfg(target_os = "macos")]
     crate::macos::clear(fd.as_fd())?;
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    crate::bsd::harden(fd.as_fd(), directory)?;
     validate(fd, directory, Some(id)).map(|_| ())
 }
 impl PrivateDir {
@@ -407,38 +438,147 @@ impl PrivateDir {
         }
         Ok((parent, leaf))
     }
-    /// Open an existing regular file for reading, without metadata mutation.
+    /// Open an existing regular file for reading without metadata mutation.
     pub fn open_file(&self, path: impl AsRef<Path>) -> Result<PrivateFile> {
+        self.open_file_with(path, OpenOptions::default())
+    }
+    /// Exclusively create a readable and writable private file.
+    pub fn create(&self, path: impl AsRef<Path>) -> Result<PrivateFile> {
+        self.open_file_with(
+            path,
+            OpenOptions {
+                access: FileAccess::ReadWrite,
+                creation: FileCreation::CreateNew,
+                ..OpenOptions::default()
+            },
+        )
+    }
+    /// Acquire a file through its retained parent, then validate before truncating.
+    /// `OpenOrCreate` never truncates unless `truncate` is explicitly selected.
+    pub fn open_file_with(
+        &self,
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<PrivateFile> {
+        options.validate()?;
         let (parent, leaf) = self.parent(path.as_ref())?;
-        let fd = open_component(&parent, leaf, OFlags::RDONLY, Mode::empty(), self.resolver)?;
-        let id = validate(&fd, false, None)?;
-        Ok(PrivateFile {
+        let access = match options.access {
+            FileAccess::Read => OFlags::RDONLY,
+            FileAccess::ReadWrite => OFlags::RDWR,
+        };
+        let create = || -> Result<(OwnedFd, Identity)> {
+            creation_parent(&parent)?;
+            let fd = open_component(
+                &parent,
+                leaf,
+                access | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+                self.resolver,
+            )?;
+            let id = identity(&fs::fstat(&fd)?);
+            normalize_created(&fd, false, id)?;
+            Ok((fd, id))
+        };
+        let (fd, id) = match options.creation {
+            FileCreation::Existing => open_existing_file(&parent, leaf, access, self.resolver)?,
+            FileCreation::CreateNew => create()?,
+            FileCreation::OpenOrCreate => {
+                let mut acquired = None;
+                for _ in 0..128 {
+                    match open_existing_file(&parent, leaf, access, self.resolver) {
+                        Ok(file) => {
+                            acquired = Some(file);
+                            break;
+                        }
+                        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => (),
+                        Err(e) => return Err(e),
+                    }
+                    match create() {
+                        Ok(file) => {
+                            acquired = Some(file);
+                            break;
+                        }
+                        Err(Error::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => (),
+                        Err(e) => return Err(e),
+                    }
+                }
+                acquired.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "file acquisition repeatedly raced",
+                    )
+                })?
+            }
+        };
+        let file = PrivateFile {
             file: fd.into(),
             id,
             links: 1,
+            verification: options.verification,
+        };
+        if options.truncate {
+            file.set_len(0)?;
+        }
+        Ok(file)
+    }
+    /// Enumerate native names through this descriptor. This is not a snapshot.
+    /// Names confer no authority; securely open an entry before using it.
+    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStrExt;
+        self.check_private()?;
+        let entries = fs::Dir::read_from(&self.fd)?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let name = OsStr::from_bytes(name);
+            RelativePath::new(Path::new(name))?;
+            names.push(name.to_os_string());
+        }
+        self.check_private()?;
+        Ok(names)
+    }
+    /// Remove a verified regular file. Missing files return `Io(NotFound)`.
+    /// Unix unlink acts on the current name; callers must coordinate same-user
+    /// namespace writers. `Full` syncs the parent; `Data` adds no deletion sync.
+    /// This also permits caller-selected orphan removal during exclusive maintenance.
+    pub fn remove_file(&self, path: impl AsRef<Path>, durability: Durability) -> Result<()> {
+        let (parent, name) = self.atomic_parent(path.as_ref())?;
+        let target = parent.open_file(&name)?;
+        target.verify()?;
+        let current = parent.open_file(&name)?;
+        if !current.same_object(&target) {
+            return Err(Error::IdentityChanged);
+        }
+        parent.check_private()?;
+        let mut may_have_removed = false;
+        let result = (|| {
+            #[cfg(target_os = "freebsd")]
+            let removal = crate::bsd::unlink(&parent.fd, &name, &target);
+            #[cfg(not(target_os = "freebsd"))]
+            let removal = fs::unlinkat(&parent.fd, &name, AtFlags::empty()).map_err(Error::from);
+            if let Err(error) = removal {
+                may_have_removed = !error.namespace_unchanged();
+                return Err(error);
+            }
+            may_have_removed = true;
+            if durability == Durability::Full {
+                parent.sync_parent(durability)?;
+            }
+            parent.check_private()
+        })();
+        result.map_err(|source| Error::Removal {
+            may_have_removed,
+            source: Box::new(source),
         })
     }
-    /// Exclusively create a readable and writable file with initial mode 0600.
-    pub fn create(&self, path: impl AsRef<Path>) -> Result<PrivateFile> {
+    /// Open an existing private directory without creating or hardening it.
+    pub fn open_dir(&self, path: impl AsRef<Path>) -> Result<Self> {
         let (parent, leaf) = self.parent(path.as_ref())?;
-        #[cfg(target_os = "macos")]
-        crate::macos::creation_parent(&parent)?;
-        let fd = open_component(
-            &parent,
-            leaf,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(0o600),
-            self.resolver,
-        )?;
-        let s = fs::fstat(&fd)?;
-        let id = identity(&s);
-        normalize_created(&fd, false, id)?;
-        validate(&fd, false, Some(id))?;
-        Ok(PrivateFile {
-            file: fd.into(),
-            id,
-            links: 1,
-        })
+        Self::directory_at(parent, leaf, false, false, self.resolver)
     }
     /// Exclusively create the final directory. Private parents must already exist.
     pub fn create_dir(&self, path: impl AsRef<Path>) -> Result<Self> {
@@ -460,6 +600,13 @@ impl PrivateFile {
     pub fn verify(&self) -> Result<()> {
         validate_links(&self.file, false, Some(self.id), self.links).map(|_| ())
     }
+    /// Resize the exact validated object. An error after mutation can leave the
+    /// new length in effect. Native read-only handles refuse this operation.
+    pub fn set_len(&self, length: u64) -> Result<()> {
+        self.verify()?;
+        self.file.set_len(length)?;
+        self.verify()
+    }
     /// Sync file data with security revalidation; does not sync a parent directory.
     pub fn sync_data(&self) -> Result<()> {
         self.verify()?;
@@ -474,7 +621,11 @@ impl PrivateFile {
         self.verify()
     }
     fn check_io(&self) -> io::Result<()> {
-        self.verify().map_err(io::Error::other)
+        if self.verification == Verification::PerIo {
+            self.verify().map_err(io::Error::other)
+        } else {
+            Ok(())
+        }
     }
 }
 impl Read for PrivateFile {
@@ -501,7 +652,9 @@ impl Write for PrivateFile {
 impl Seek for PrivateFile {
     fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
         self.check_io()?;
-        self.file.seek(p)
+        let position = self.file.seek(p)?;
+        self.check_io()?;
+        Ok(position)
     }
 }
 impl AsFd for PrivateFile {
@@ -515,7 +668,7 @@ impl AsFd for PrivateDir {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests;
 
 #[cfg(target_os = "macos")]
@@ -595,6 +748,7 @@ impl PrivateDir {
                 file: fd.into(),
                 id,
                 links: 0,
+                verification: Verification::PerIo,
             }))
         }
         #[cfg(not(target_os = "linux"))]
@@ -620,7 +774,21 @@ impl PrivateDir {
         _temp: &PrivateFile,
         name: &OsStr,
         target: &OsStr,
+        policy: crate::Publication,
     ) -> Result<()> {
+        if policy == crate::Publication::CreateNew {
+            #[cfg(target_os = "freebsd")]
+            return crate::bsd::publish_new(&self.fd, name, target);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                fs::renameat_with(&self.fd, name, &self.fd, target, fs::RenameFlags::NOREPLACE)?;
+                return Ok(());
+            }
+            #[cfg(target_os = "netbsd")]
+            return Err(Error::UnsupportedPolicy {
+                policy: "atomic create-only publication",
+            });
+        }
         fs::renameat(&self.fd, name, &self.fd, target)?;
         Ok(())
     }
@@ -636,9 +804,9 @@ impl PrivateDir {
                 Err(e) => return Err(e),
                 _ => (),
             }
-            // POSIX has no descriptor-bound unlink or atomic compare-and-unlink.
-            // Even matching metadata cannot authorize a subsequent unlinkat of a
-            // mutable name. Preserve a private orphan instead of deleting a replacement.
+            #[cfg(target_os = "freebsd")]
+            return crate::bsd::unlink(&self.fd, name, temp);
+            #[cfg(not(target_os = "freebsd"))]
             return Err(Error::UnsupportedFilesystem {
                 capability: "identity-bound named-temp deletion",
             });

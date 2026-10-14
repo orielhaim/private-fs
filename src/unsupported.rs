@@ -21,7 +21,23 @@ impl PrivateDir {
     pub fn open_file(&self, _: impl AsRef<Path>) -> Result<PrivateFile> {
         unsupported()
     }
+    pub fn open_file_with(
+        &self,
+        _: impl AsRef<Path>,
+        _: crate::OpenOptions,
+    ) -> Result<PrivateFile> {
+        unsupported()
+    }
+    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        unsupported()
+    }
+    pub fn remove_file(&self, _: impl AsRef<Path>, _: crate::Durability) -> Result<()> {
+        unsupported()
+    }
     pub fn create(&self, _: impl AsRef<Path>) -> Result<PrivateFile> {
+        unsupported()
+    }
+    pub fn open_dir(&self, _: impl AsRef<Path>) -> Result<Self> {
         unsupported()
     }
     pub fn create_dir(&self, _: impl AsRef<Path>) -> Result<Self> {
@@ -39,6 +55,9 @@ fn unsupported<T>() -> Result<T> {
 
 impl PrivateFile {
     pub fn harden(&self) -> Result<()> {
+        unsupported()
+    }
+    pub fn set_len(&self, _: u64) -> Result<()> {
         unsupported()
     }
     pub fn verify(&self) -> Result<()> {
@@ -98,6 +117,14 @@ pub struct AtomicFile {
 }
 impl PrivateDir {
     pub fn atomic(&self, _: impl AsRef<Path>) -> Result<AtomicFile> {
+        unsupported()
+    }
+    pub fn atomic_with_policy(
+        &self,
+        _: impl AsRef<Path>,
+        _: crate::Durability,
+        _: crate::Publication,
+    ) -> Result<AtomicFile> {
         unsupported()
     }
     pub fn atomic_durable(&self, _: impl AsRef<Path>) -> Result<AtomicFile> {

@@ -31,6 +31,23 @@ pub(super) fn open(
 ) -> Result<OwnedHandle> {
     open_access(parent, name, directory, disposition, user, None)
 }
+pub(super) fn open_file(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    disposition: u32,
+    user: Option<&Sid>,
+    writable: bool,
+    deleting: bool,
+) -> Result<OwnedHandle> {
+    let access = (FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE) as u32
+        | if writable { FILE_WRITE_DATA as u32 } else { 0 }
+        | if deleting || disposition != FILE_OPEN as u32 {
+            DELETE as u32
+        } else {
+            0
+        };
+    open_access(Some(parent), name, false, disposition, user, Some(access))
+}
 fn open_access(
     parent: Option<&OwnedHandle>,
     name: &OsStr,
@@ -69,7 +86,11 @@ fn open_access(
         FILE_ALL_ACCESS as u32
     } else {
         (FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE) as u32
-            | if directory { 0 } else { FILE_READ_DATA as u32 }
+            | if directory {
+                FILE_LIST_DIRECTORY as u32
+            } else {
+                FILE_READ_DATA as u32
+            }
     };
     let desired = desired_override.unwrap_or(desired);
     let mut handle = ptr::null_mut();
@@ -229,8 +250,19 @@ pub(super) fn directory_for_sync(parent: &OwnedHandle) -> Result<OwnedHandle> {
     )
 }
 
-pub(super) fn rename(file: impl AsHandle, parent: &OwnedHandle, target: &OsStr) -> Result<()> {
-    rename_impl(file, parent, target, false)
+pub(super) fn rename_with_policy(
+    file: impl AsHandle,
+    parent: &OwnedHandle,
+    target: &OsStr,
+    policy: crate::Publication,
+) -> Result<()> {
+    rename_impl(
+        file,
+        parent,
+        target,
+        false,
+        policy == crate::Publication::Replace,
+    )
 }
 #[cfg(test)]
 pub(super) fn rename_classic(
@@ -238,13 +270,14 @@ pub(super) fn rename_classic(
     parent: &OwnedHandle,
     target: &OsStr,
 ) -> Result<()> {
-    rename_impl(file, parent, target, true)
+    rename_impl(file, parent, target, true, true)
 }
 fn rename_impl(
     file: impl AsHandle,
     parent: &OwnedHandle,
     target: &OsStr,
     force_classic: bool,
+    replace: bool,
 ) -> Result<()> {
     let name: Vec<u16> = target.encode_wide().collect();
     let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
@@ -255,8 +288,12 @@ fn rename_impl(
     // and UTF-16 tail. RootDirectory pins the destination; source is the live
     // file handle. No complete pathname or mutable source name is reopened.
     unsafe {
-        (*rename).Anonymous.Flags =
-            (FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS) as u32;
+        (*rename).Anonymous.Flags = FILE_RENAME_POSIX_SEMANTICS as u32
+            | if replace {
+                FILE_RENAME_REPLACE_IF_EXISTS as u32
+            } else {
+                0
+            };
         (*rename).RootDirectory = parent.as_raw_handle();
         (*rename).FileNameLength = (name.len() * 2) as u32;
         ptr::copy_nonoverlapping(
@@ -285,7 +322,7 @@ fn rename_impl(
             // Older kernels/filesystems retain classic atomic rename semantics,
             // but can refuse open destinations. Never emulate replacement by unlink.
             (*rename).Anonymous.Flags = 0;
-            (*rename).Anonymous.ReplaceIfExists = true;
+            (*rename).Anonymous.ReplaceIfExists = replace;
             return nt_result(NtSetInformationFile(
                 file.as_handle().as_raw_handle(),
                 &mut status,
@@ -339,4 +376,96 @@ pub(super) fn security_handle(handle: impl AsHandle) -> Result<OwnedHandle> {
         None,
         Some((READ_CONTROL | WRITE_DAC) as u32),
     )
+}
+
+pub(super) fn directory_for_listing(parent: &OwnedHandle) -> Result<OwnedHandle> {
+    open_access(
+        Some(parent),
+        OsStr::new(""),
+        true,
+        FILE_OPEN as u32,
+        None,
+        Some((FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE) as u32),
+    )
+}
+pub(super) fn entries(handle: impl AsHandle) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut storage = vec![0u64; 65536 / size_of::<u64>()];
+    let bytes = storage.len() * size_of::<u64>();
+    let mut class = FileIdBothDirectoryRestartInfo;
+    let mut names = Vec::new();
+    loop {
+        storage.fill(0);
+        // SAFETY: pointer-aligned storage covers the directory information buffer.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_handle().as_raw_handle(),
+                class,
+                storage.as_mut_ptr().cast(),
+                bytes as u32,
+            )
+        };
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            return Err(error.into());
+        }
+        class = FileIdBothDirectoryInfo;
+        let mut offset = 0usize;
+        loop {
+            let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            if !offset.is_multiple_of(std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>())
+                || bytes - offset < size_of::<FILE_ID_BOTH_DIR_INFO>()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed directory record",
+                )
+                .into());
+            }
+            // SAFETY: aligned record header and filename range are bounded before reads.
+            let (name, next) = unsafe {
+                let record = &*storage
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<FILE_ID_BOTH_DIR_INFO>();
+                let length = record.FileNameLength as usize;
+                let next = record.NextEntryOffset as usize;
+                let record_bytes = if next == 0 { bytes - offset } else { next };
+                if !length.is_multiple_of(2)
+                    || record_bytes < name_offset
+                    || record_bytes > bytes - offset
+                    || length > record_bytes - name_offset
+                    || (next != 0 && next < size_of::<FILE_ID_BOTH_DIR_INFO>())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed directory name",
+                    )
+                    .into());
+                }
+                let units = std::slice::from_raw_parts(
+                    storage
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset + name_offset)
+                        .cast::<u16>(),
+                    length / 2,
+                );
+                (std::ffi::OsString::from_wide(units), next)
+            };
+            if name != OsStr::new(".") && name != OsStr::new("..") {
+                crate::path::RelativePath::new(std::path::Path::new(&name))?;
+                names.push(name);
+            }
+            if next == 0 {
+                break;
+            }
+            offset += next;
+        }
+    }
+    Ok(names)
 }
