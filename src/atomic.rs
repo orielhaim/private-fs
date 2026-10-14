@@ -1,5 +1,5 @@
 //! Atomic transaction state and persistence ordering, shared by native backends.
-use crate::{Durability, Error, PrivateDir, PrivateFile, Result};
+use crate::{Durability, Error, PrivateDir, PrivateFile, Publication, Result};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -77,7 +77,8 @@ impl Faults {
         }
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-        let mut name = String::from(".private-fs-");
+        let mut name = String::with_capacity(48);
+        name.push_str(".private-fs-");
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for byte in nonce {
             name.push(HEX[(byte >> 4) as usize] as char);
@@ -102,6 +103,7 @@ pub struct AtomicFile {
     temp: PrivateFile,
     name: Option<OsString>,
     durability: Durability,
+    policy: Publication,
     state: State,
     failed_io: bool,
     faults: Faults,
@@ -127,6 +129,24 @@ impl PrivateDir {
         durability: Durability,
     ) -> Result<AtomicFile> {
         AtomicFile::new(self, path.as_ref(), durability, Faults::default())
+    }
+    /// Stage with explicit atomic destination and persistence policies.
+    /// NetBSD rejects `CreateNew` before creating staging.
+    pub fn atomic_with_policy(
+        &self,
+        path: impl AsRef<Path>,
+        durability: Durability,
+        policy: Publication,
+    ) -> Result<AtomicFile> {
+        #[cfg(target_os = "netbsd")]
+        if policy == Publication::CreateNew {
+            return Err(Error::UnsupportedPolicy {
+                policy: "atomic create-only publication",
+            });
+        }
+        let mut writer = AtomicFile::new(self, path.as_ref(), durability, Faults::default())?;
+        writer.policy = policy;
+        Ok(writer)
     }
     /// Stage with `Full` durability: file sync, publication, then parent sync.
     pub fn atomic_durable(&self, path: impl AsRef<Path>) -> Result<AtomicFile> {
@@ -202,6 +222,7 @@ impl AtomicFile {
             temp,
             name,
             durability,
+            policy: Publication::Replace,
             state: State::Unpublished,
             failed_io: false,
             faults,
@@ -299,7 +320,15 @@ impl AtomicFile {
             .expect("materialized before publication");
         self.binding(name)?;
         self.state = State::Publishing; // A syscall error may have ambiguous effects.
-        self.parent.publish_temp(&self.temp, name, &self.target)?;
+        if let Err(error) = self
+            .parent
+            .publish_temp(&self.temp, name, &self.target, self.policy)
+        {
+            if error.namespace_unchanged() {
+                self.state = State::Unpublished;
+            }
+            return Err(error);
+        }
         self.state = State::Published; // Set before any fallible post-publication step.
         self.checkpoint(FaultPoint::AfterPublish)?;
         self.checkpoint(FaultPoint::BeforeReopen)?;

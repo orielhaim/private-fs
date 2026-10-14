@@ -1,5 +1,8 @@
-use private_fs::{Durability, PrivateDir};
-use std::{fs::File, io::Write};
+use private_fs::{Durability, OpenOptions, PrivateDir, Verification};
+use std::{
+    fs::File,
+    io::{Read, Write},
+};
 
 fn main() {
     divan::main();
@@ -87,4 +90,52 @@ fn handle_harden(bencher: divan::Bencher) {
         .open(fixture._temp.path().join("private/nested/data"))
         .unwrap();
     bencher.bench_local(|| private_fs::harden(&file).unwrap());
+}
+
+#[divan::bench]
+fn enumerate(bencher: divan::Bencher) {
+    let fixture = Fixture::new();
+    for n in 0..100 {
+        fixture.dir.create(format!("entry-{n}")).unwrap();
+    }
+    bencher.bench_local(|| divan::black_box(fixture.dir.entries().unwrap()));
+}
+
+#[divan::bench]
+fn remove(bencher: divan::Bencher) {
+    bencher.with_inputs(Fixture::new).bench_refs(|fixture| {
+        fixture
+            .dir
+            .remove_file("nested/data", Durability::None)
+            .unwrap();
+    });
+}
+
+#[divan::bench(args = [Verification::PerIo, Verification::OnDemand])]
+fn streaming_read(bencher: divan::Bencher, verification: Verification) {
+    let fixture = Fixture::new();
+    fixture
+        .dir
+        .create("stream")
+        .unwrap()
+        .write_all(&[42; 65536])
+        .unwrap();
+    bencher.bench_local(|| {
+        let mut file = fixture
+            .dir
+            .open_file_with(
+                "stream",
+                OpenOptions {
+                    verification,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+        file.verify().unwrap();
+        let mut buffer = [0u8; 1024];
+        while file.read(&mut buffer).unwrap() != 0 {
+            divan::black_box(&buffer);
+        }
+        file.verify().unwrap();
+    });
 }

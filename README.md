@@ -1,6 +1,6 @@
 # private-fs
 
-Private filesystem capabilities for Linux, macOS, and Windows
+Private filesystem capabilities for Linux, macOS, Windows, FreeBSD and NetBSD
 
 Files and directories are private from creation. Operations stay bound to validated filesystem objects instead of reopening full paths
 
@@ -31,6 +31,7 @@ The crate:
 - rejects symlinks, reparse points, traversal, and namespace escape;
 - uses protected user-only DACLs on Windows;
 - validates macOS extended ACLs and ownership enforcement;
+- verifies BSD POSIX/NFSv4 ACLs and creation inheritance;
 - fails closed when the filesystem cannot provide the required semantics.
 
 Existing objects are never hardened implicitly.
@@ -45,6 +46,41 @@ file.verify()?;
 file.harden()?;
 # Ok::<(), private_fs::Error>(())
 ```
+
+## Manage application state
+
+```rust,no_run
+use private_fs::{Durability, FileAccess, FileCreation, OpenOptions, PrivateDir};
+use std::io::{Seek, SeekFrom, Write};
+
+let dir = PrivateDir::open("app-private")?;
+let state = dir.ensure_dir_all("cache/session")?;
+let mut file = state.open_file_with("data", OpenOptions {
+    access: FileAccess::ReadWrite,
+    creation: FileCreation::OpenOrCreate,
+    ..OpenOptions::default()
+})?;
+file.seek(SeekFrom::Start(0))?;
+file.write_all(b"state")?;
+file.set_len(5)?;
+file.sync_all()?;
+drop(file);
+
+for name in state.entries()? {
+    state.open_file(&name)?.verify()?;
+}
+state.remove_file("data", Durability::Full)?;
+# Ok::<(), private_fs::Error>(())
+```
+
+Opening existing files preserves contents. Select `truncate: true` to resize only
+after validation. `open_dir` verifies an existing child directory without creating
+it. Enumeration returns native names, not authorized file objects or a snapshot.
+
+`Verification::PerIo` is the default. `OnDemand` lets callers bracket a larger
+streaming transaction with `verify()`; it does not detect metadata changes during
+individual reads and writes. Sync and resizing still verify under both policies.
+Strict owner-only access remains fixed. Hardening is explicit and handle-bound.
 
 ## Atomic writes
 
@@ -71,7 +107,17 @@ Durability is explicit:
 | `Data` | sync file data before publication |
 | `write_atomic_durable` | sync file, publish, sync parent |
 
-Linux uses `O_TMPFILE` where available. Named Unix staging files may intentionally remain after failure when safe identity-bound deletion is unavailable.
+`atomic_with_policy(path, durability, Publication::CreateNew)` fails atomically if
+any destination exists. NetBSD explicitly rejects this optional policy.
+
+Linux uses `O_TMPFILE` where available. FreeBSD uses `funlinkat` for identity-bound
+named staging cleanup. Named Linux, macOS, and NetBSD staging files may intentionally remain after failure.
+During exclusive maintenance, select known abandoned entries and use `remove_file`.
+The library never deletes files solely because their names match a prefix.
+
+FreeBSD requires the containment fix in 15.1-p1 or later and checks its behavior
+at runtime. Keep every supported OS patched. See the security contract for
+filesystem requirements and platform differences.
 
 ## Scope
 

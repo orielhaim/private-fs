@@ -11,7 +11,10 @@
 mod bindings;
 mod nt;
 mod security;
-use crate::{Error, Result, path::RelativePath};
+use crate::{
+    Durability, Error, FileAccess, FileCreation, OpenOptions, Result, Verification,
+    path::RelativePath,
+};
 use bindings::{FILE_CREATE, FILE_OPEN, FILE_OPEN_IF};
 use security::Sid;
 use std::{
@@ -35,6 +38,7 @@ pub struct PrivateFile {
     file: File,
     id: nt::Identity,
     user: Sid,
+    verification: Verification,
 }
 fn harden(handle: impl AsHandle, directory: bool, id: nt::Identity, user: &Sid) -> Result<()> {
     nt::metadata(handle.as_handle(), directory, Some(id))?;
@@ -144,37 +148,95 @@ impl PrivateDir {
         }
         Ok((parent, leaf))
     }
-    /// Open a verified regular file for reading, relative to this capability.
+    /// Open an existing regular file for reading without metadata mutation.
     pub fn open_file(&self, path: impl AsRef<Path>) -> Result<PrivateFile> {
-        let (parent, name) = self.parent(path.as_ref())?;
-        let handle = nt::open(Some(&parent), name, false, FILE_OPEN as u32, None)?;
-        let id = nt::validate(&handle, false, None, &self.user)?;
-        Ok(PrivateFile {
-            file: handle.into(),
-            id,
-            user: self.user.clone(),
-        })
+        self.open_file_with(path, OpenOptions::default())
     }
-    /// Exclusively create a readable/writable file with an owner-only protected DACL.
+    /// Exclusively create a readable and writable private file.
     pub fn create(&self, path: impl AsRef<Path>) -> Result<PrivateFile> {
-        let (parent, name) = self.parent(path.as_ref())?;
-        self.create_at(&parent, name)
+        self.open_file_with(
+            path,
+            OpenOptions {
+                access: FileAccess::ReadWrite,
+                creation: FileCreation::CreateNew,
+                ..OpenOptions::default()
+            },
+        )
     }
-    fn create_at(&self, parent: &OwnedHandle, name: &OsStr) -> Result<PrivateFile> {
-        nt::volume(parent)?;
-        let handle = nt::open(
-            Some(parent),
+    /// Acquire through the retained parent, then validate before truncating.
+    pub fn open_file_with(
+        &self,
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<PrivateFile> {
+        options.validate()?;
+        let (parent, name) = self.parent(path.as_ref())?;
+        nt::volume(&parent)?;
+        let disposition = match options.creation {
+            FileCreation::Existing => FILE_OPEN,
+            FileCreation::CreateNew => FILE_CREATE,
+            FileCreation::OpenOrCreate => FILE_OPEN_IF,
+        } as u32;
+        let handle = nt::open_file(
+            &parent,
             name,
+            disposition,
+            (options.creation != FileCreation::Existing).then_some(&self.user),
+            options.access == FileAccess::ReadWrite,
             false,
-            FILE_CREATE as u32,
-            Some(&self.user),
         )?;
         let id = nt::validate(&handle, false, None, &self.user)?;
-        Ok(PrivateFile {
+        let file = PrivateFile {
             file: handle.into(),
             id,
             user: self.user.clone(),
+            verification: options.verification,
+        };
+        if options.truncate {
+            file.set_len(0)?;
+        }
+        Ok(file)
+    }
+    /// Enumerate native names through this handle. This is not a snapshot.
+    /// Names confer no authority; securely open an entry before using it.
+    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
+        self.check_private()?;
+        let listing = nt::directory_for_listing(&self.handle)?;
+        nt::validate(&listing, true, Some(self.id), &self.user)?;
+        let names = nt::entries(&listing)?;
+        self.check_private()?;
+        Ok(names)
+    }
+    /// Remove the exact validated regular file using native handle disposition.
+    /// Missing files return `Io(NotFound)`. Removal can remain pending while other
+    /// handles are open. `Full` flushes the parent; `Data` adds no deletion sync.
+    pub fn remove_file(&self, path: impl AsRef<Path>, durability: Durability) -> Result<()> {
+        let (parent, name) = self.atomic_parent(path.as_ref())?;
+        let handle = nt::open_file(&parent.handle, &name, FILE_OPEN as u32, None, false, true)?;
+        nt::validate(&handle, false, None, &self.user)?;
+        parent.check_private()?;
+        let mut may_have_removed = false;
+        let result = (|| {
+            if let Err(error) = nt::delete(&handle) {
+                may_have_removed = !error.namespace_unchanged();
+                return Err(error);
+            }
+            may_have_removed = true;
+            drop(handle);
+            if durability == Durability::Full {
+                parent.sync_parent(durability)?;
+            }
+            parent.check_private()
+        })();
+        result.map_err(|source| Error::Removal {
+            may_have_removed,
+            source: Box::new(source),
         })
+    }
+    /// Open an existing private directory without creating or hardening it.
+    pub fn open_dir(&self, path: impl AsRef<Path>) -> Result<Self> {
+        let (parent, name) = self.parent(path.as_ref())?;
+        Self::directory_at(&parent, name, FILE_OPEN as u32, &self.user)
     }
     /// Exclusively create the final private directory; private parents must exist.
     pub fn create_dir(&self, path: impl AsRef<Path>) -> Result<Self> {
@@ -196,6 +258,13 @@ impl PrivateFile {
     pub fn verify(&self) -> Result<()> {
         nt::validate(&self.file, false, Some(self.id), &self.user).map(|_| ())
     }
+    /// Resize the exact validated object. An error after mutation can leave the
+    /// new length in effect. Native read-only handles refuse this operation.
+    pub fn set_len(&self, length: u64) -> Result<()> {
+        self.verify()?;
+        self.file.set_len(length)?;
+        self.verify()
+    }
     /// Sync file data with revalidation; does not sync a parent directory.
     pub fn sync_data(&self) -> Result<()> {
         self.verify()?;
@@ -209,7 +278,11 @@ impl PrivateFile {
         self.verify()
     }
     fn check_io(&self) -> io::Result<()> {
-        self.verify().map_err(io::Error::other)
+        if self.verification == Verification::PerIo {
+            self.verify().map_err(io::Error::other)
+        } else {
+            Ok(())
+        }
     }
 }
 impl Read for PrivateFile {
@@ -236,7 +309,9 @@ impl Write for PrivateFile {
 impl Seek for PrivateFile {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.check_io()?;
-        self.file.seek(position)
+        let position = self.file.seek(position)?;
+        self.check_io()?;
+        Ok(position)
     }
 }
 impl AsHandle for PrivateDir {
@@ -290,8 +365,9 @@ impl PrivateDir {
         temp: &PrivateFile,
         _name: &OsStr,
         target: &OsStr,
+        policy: crate::Publication,
     ) -> Result<()> {
-        nt::rename(&temp.file, &self.handle, target)
+        nt::rename_with_policy(&temp.file, &self.handle, target, policy)
     }
     pub(crate) fn cleanup_temp(&self, temp: &PrivateFile, _name: Option<&OsStr>) -> Result<()> {
         self.check_private()?;

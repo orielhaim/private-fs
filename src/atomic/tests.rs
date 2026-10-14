@@ -421,7 +421,7 @@ fn abort_cleanup_reports_platform_guarantees() {
     .unwrap();
     let result = writer.abort();
     assert!(!root.path().join("private/data").exists());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "freebsd"))]
     {
         result.unwrap();
         assert_eq!(
@@ -431,7 +431,7 @@ fn abort_cleanup_reports_platform_guarantees() {
             0
         );
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "freebsd")))]
     {
         assert!(matches!(result, Err(Error::UnsupportedFilesystem { .. })));
         assert_eq!(
@@ -645,13 +645,13 @@ fn cleanup_after_checkpoint_and_primary_error_are_preserved() {
         ..Default::default()
     };
     // Default staging is anonymous on Linux, exact-handle-deletable on Windows.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "freebsd"))]
     {
         let writer = AtomicFile::new(&dir, Path::new("other"), Durability::None, faults).unwrap();
         assert!(writer.abort().is_err());
         assert!(*hit.borrow());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "netbsd"))]
     {
         let _ = faults;
     }
@@ -895,7 +895,7 @@ fn an_open_reader_survives_replacement_without_partial_contents() {
 }
 #[test]
 fn native_target_names_are_preserved_without_lossy_conversion() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
     let name = {
         use std::os::unix::ffi::OsStringExt;
         OsString::from_vec(vec![b'k', 0xff])

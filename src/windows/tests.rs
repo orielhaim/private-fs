@@ -72,6 +72,8 @@ fn world() -> Sid {
     unsafe { Sid::copy_from(storage.as_mut_ptr().cast()) }.unwrap()
 }
 fn set_acl(handle: impl AsHandle, entries: &[(&Sid, u32, u32)], protected: bool) {
+    let writable = nt::security_handle(handle.as_handle()).unwrap();
+    let handle = writable.as_handle();
     let mut acl = vec![0u32; 256];
     let raw = acl.as_mut_ptr().cast::<ACL>();
     // SAFETY: aligned ACL allocation covers all small test ACEs and SIDs stay live.
@@ -309,7 +311,22 @@ fn namespace_replacement_after_validation_keeps_the_original_parent() {
     .join()
     .unwrap();
     // This is the same publication-independent create sequence used by create.
-    let mut file = dir.create_at(&parent, leaf).unwrap();
+    let handle = nt::open_file(
+        &parent,
+        leaf,
+        FILE_CREATE as u32,
+        Some(&dir.user),
+        true,
+        false,
+    )
+    .unwrap();
+    let id = nt::validate(&handle, false, None, &dir.user).unwrap();
+    let mut file = PrivateFile {
+        file: handle.into(),
+        id,
+        user: dir.user.clone(),
+        verification: Verification::PerIo,
+    };
     file.write_all(b"original-parent").unwrap();
     assert_eq!(
         std::fs::read(root.join("spare/key")).unwrap(),
@@ -441,7 +458,7 @@ fn empty_and_null_dacls_and_inheritable_aces_are_rejected() {
     assert_eq!(
         unsafe {
             SetSecurityInfo(
-                file.as_handle().as_raw_handle(),
+                nt::security_handle(&file).unwrap().as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION as u32 | PROTECTED_DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
@@ -471,6 +488,84 @@ fn unpaired_utf16_names_are_not_lossily_converted() {
     let name = OsString::from_wide(&[b'k' as u16, 0xd800]);
     dir.create(&name).unwrap();
     dir.open_file(&name).unwrap().verify().unwrap();
+}
+
+#[test]
+fn enumeration_spans_native_buffers_and_owns_each_scan_cursor() {
+    let (_temp, dir) = fixture();
+    let mut expected = Vec::new();
+    for n in 0..300 {
+        let name = format!("entry-{n:03}-{}", "x".repeat(180));
+        dir.create(&name).unwrap();
+        expected.push(std::ffi::OsString::from(name));
+    }
+    for _ in 0..2 {
+        let mut names = dir.entries().unwrap();
+        names.sort();
+        assert_eq!(names, expected);
+    }
+}
+
+#[test]
+fn readonly_deletion_refusal_is_definite_and_preserves_contents() {
+    let (temp, dir) = fixture();
+    dir.create("data").unwrap().write_all(b"original").unwrap();
+    let path = temp.path().join("private/data");
+    let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut permissions = original_permissions.clone();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    assert!(matches!(
+        dir.remove_file("data", crate::Durability::None),
+        Err(Error::Removal {
+            may_have_removed: false,
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    std::fs::set_permissions(&path, original_permissions).unwrap();
+    dir.remove_file("data", crate::Durability::None).unwrap();
+    assert!(!path.exists());
+}
+
+#[rstest::rstest]
+fn verification_policy_has_explicit_streaming_boundaries(
+    #[values(Verification::PerIo, Verification::OnDemand)] verification: Verification,
+) {
+    let (_temp, dir) = fixture();
+    let original = dir.create("data").unwrap();
+    let mut file = dir
+        .open_file_with(
+            "data",
+            OpenOptions {
+                access: FileAccess::ReadWrite,
+                verification,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+    set_acl(&original, &[(&world(), FILE_ALL_ACCESS as u32, 0)], true);
+    assert!(matches!(file.verify(), Err(Error::InsecureAcl)));
+    if verification == Verification::PerIo {
+        assert!(file.write(b"secret").is_err());
+    } else {
+        file.write_all(b"secret").unwrap();
+    }
+    assert!(matches!(file.sync_all(), Err(Error::InsecureAcl)));
+    original.harden().unwrap();
+    let mut contents = Vec::new();
+    dir.open_file("data")
+        .unwrap()
+        .read_to_end(&mut contents)
+        .unwrap();
+    assert_eq!(
+        contents,
+        if verification == Verification::PerIo {
+            b"".as_slice()
+        } else {
+            b"secret"
+        }
+    );
 }
 
 #[test]

@@ -6,12 +6,17 @@ use std::os::unix::{
 };
 
 fn each(mut test: impl FnMut(PrivateDir, &Path)) {
-    for resolver in [
+    #[cfg(target_os = "linux")]
+    let resolvers = [
         Resolver::Auto,
         Resolver::OpenAt2,
         Resolver::Walk,
         Resolver::Unavailable,
-    ] {
+    ]
+    .into_iter();
+    #[cfg(not(target_os = "linux"))]
+    let resolvers = std::iter::once(Resolver::Auto);
+    for resolver in resolvers {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("private");
         let dir = PrivateDir::acquire(&root, true, resolver).unwrap();
@@ -360,5 +365,47 @@ fn hardening_is_explicit_and_does_not_repair_hard_links() {
                 & 0o7777,
             0o644
         );
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn posix_acl_mask_and_inherited_modes_prevent_additional_access() {
+    each(|dir, root| {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1u16, 7u16, u32::MAX),
+            (2, 7, 12345),
+            (4, 7, u32::MAX),
+            (16, 7, u32::MAX),
+            (32, 7, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        fs::fsetxattr(
+            &dir,
+            "system.posix_acl_default",
+            &acl,
+            fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        let nested = dir.create_dir("nested-acl").unwrap();
+        let file = nested.create("data").unwrap();
+        file.verify().unwrap();
+        assert_eq!(fs::fstat(&file).unwrap().st_mode & 0o7777, 0o600);
+        assert_eq!(fs::fstat(&nested).unwrap().st_mode & 0o7777, 0o700);
+        let mut inherited = [0u8; 256];
+        let size = fs::fgetxattr(&file, "system.posix_acl_access", &mut inherited).unwrap();
+        assert!(size > 0);
+        chmod(&root.join("nested-acl/data"), 0o640);
+        assert!(matches!(
+            file.verify(),
+            Err(Error::InsecurePermissions { .. })
+        ));
+        file.harden().unwrap();
+        assert_eq!(fs::fstat(&file).unwrap().st_mode & 0o7777, 0o600);
+        file.verify().unwrap();
     });
 }

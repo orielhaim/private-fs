@@ -50,3 +50,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: cargo audit
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          prepare: pkg install -y rust
+          envs: PROPTEST_CASES
+          run: sh tools/test-bsd.sh
+        env:
+          PROPTEST_CASES: 1024
+  netbsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/netbsd-vm@v1
+        with:
+          release: "11.0"
+          prepare: |
+            set -eu
+            /usr/sbin/pkg_add curl
+            installer=$(mktemp)
+            /usr/pkg/bin/curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$installer"
+            sh "$installer" -y --profile minimal
+            rm "$installer"
+          envs: PROPTEST_CASES
+          run: |
+            export PATH=/root/.cargo/bin:/usr/pkg/bin:/usr/pkg/sbin:$PATH
+            sh tools/test-bsd.sh
+        env:
+          PROPTEST_CASES: 1024
