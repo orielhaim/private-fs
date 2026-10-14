@@ -12,6 +12,7 @@ include = [
   "benches/**",
   "README.md",
   "SECURITY.md",
+  "CHANGELOG.md",
   "LICENSE-*",
   "Cargo.toml",
   "Cargo.lock",
