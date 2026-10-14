@@ -49,14 +49,19 @@ for profile in none posix nfs4; do
         NetBSD)
             dd if=/dev/zero of="$work/$profile.img" bs=1m count=256
             newfs -F -O 2ea "$work/$profile.img"
+            sync
             candidate=vnd0
-            vndconfig "$candidate" "$work/$profile.img"
+            echo "Configuring $candidate"
+            vndconfig -iv "$candidate" "$work/$profile.img"
+            echo "Configured $candidate"
             device="$candidate"
+            echo "Mounting profile=$profile"
             case "$profile" in
                 none) mount -t ffs "/dev/${device}d" "$mountpoint" ;;
                 posix) mount -t ffs -o posix1eacls "/dev/${device}d" "$mountpoint" ;;
                 nfs4) mount -t ffs -o nfs4acls "/dev/${device}d" "$mountpoint" ;;
             esac
+            echo "Mounted profile=$profile"
             ;;
         *) echo "unsupported native test OS: $os" >&2; exit 1 ;;
     esac
