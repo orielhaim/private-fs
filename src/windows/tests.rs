@@ -200,6 +200,21 @@ fn insecure_existing_acls_are_rejected_without_repair() {
     assert!(PrivateDir::open(temp.path().join("private")).is_ok());
 }
 #[test]
+fn directory_sync_rejects_insecure_metadata() {
+    let (_temp, dir) = fixture();
+    let other = world();
+    set_acl(
+        &dir,
+        &[
+            (&dir.user, FILE_ALL_ACCESS as u32, 0),
+            (&other, FILE_READ_DATA as u32, 0),
+        ],
+        true,
+    );
+    assert!(matches!(dir.sync_all(), Err(Error::InsecureAcl)));
+}
+
+#[test]
 fn inherited_permissive_parent_cannot_broaden_new_objects() {
     let (_temp, dir) = fixture();
     let other = world();

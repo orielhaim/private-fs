@@ -101,17 +101,26 @@ Privacy, atomic visibility, and persistence are independent:
 | --- | --- |
 | `None` | Atomic publication; no explicit flush |
 | `Data` | File data sync before publication; directory entry may be lost |
-| `Full` | File contents/metadata sync, publication, then parent directory sync |
+| `Full` | File contents/metadata sync, publication, then `PrivateDir::sync_all` |
 
 BSD `Data` requests the native file-data sync; `Full` requests file and parent
 `fsync` in publication order. Filesystem sync failures propagate.
 
-macOS `Full` also requests `F_FULLFSYNC` for file and parent. Windows uses native
-file flushes and a validated writable handle to the same parent object. Unsupported
-flushes return errors rather than reducing the requested guarantee. Hardware may
-still lie about persistence. Process-exit tests do not prove physical power-cut
-behavior. On older Windows/filesystems, classic atomic rename may refuse replacing
-an open destination when the extended POSIX rename class is unavailable.
+`PrivateDir::sync_all` synchronizes the retained directory, including namespace
+changes as supported by that filesystem. It does not synchronize file contents,
+nested directories, or the entry that names this directory in its parent. It is
+not a transaction, does not prove that a particular deletion occurred, and does
+not promise physical persistence beyond the platform and filesystem contract.
+
+macOS directory sync requests `fsync` and then `F_FULLFSYNC`. macOS `Full` also
+requests `F_FULLFSYNC` for the file. Windows uses native file flushes and a
+validated writable handle to the same directory object. Unsupported flushes
+return errors rather than reducing the requested guarantee. A Windows deletion
+can remain pending while other handles stay open; directory sync does not finish
+that disposition. Hardware may still lie about persistence. Process-exit tests
+do not prove physical power-cut behavior. On older Windows/filesystems, classic
+atomic rename may refuse replacing an open destination when the extended POSIX
+rename class is unavailable.
 
 A failed commit reports whether publication **may** have occurred. Post-publication
 failure cannot safely roll back. Check the error and construct a fresh writer to
@@ -166,7 +175,7 @@ the current name. Identity checks before that syscall detect some replacements
 but do not eliminate the compare/unlink race. Callers coordinate concurrent
 same-principal namespace writers. Other principals cannot write a verified private
 parent under this contract. The method does not recursively delete directories.
-`None` and `Data` add no deletion sync; `Full` syncs the parent after removal.
+`None` and `Data` add no deletion sync; `Full` calls `sync_all` on the parent after removal.
 `Error::Removal` distinguishes known native refusals from uncertain I/O outcomes.
 It reports possible removal after success followed by a sync/verification failure.
 A FreeBSD identity mismatch, access refusal, or supported sharing refusal reports

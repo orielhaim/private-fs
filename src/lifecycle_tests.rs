@@ -198,6 +198,41 @@ fn enumeration_and_removal(
 }
 
 #[test]
+fn directory_sync_succeeds_without_file_mutation() {
+    let (_temp, dir) = fixture();
+    dir.sync_all().unwrap();
+    assert!(dir.entries().unwrap().is_empty());
+}
+
+#[test]
+fn directory_sync_follows_non_durable_removal() {
+    let (_temp, dir) = fixture();
+    dir.create("data").unwrap();
+    dir.remove_file("data", Durability::None).unwrap();
+    assert!(
+        matches!(dir.open_file("data"), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound)
+    );
+    dir.sync_all().unwrap();
+    assert!(dir.entries().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_sync_rejects_insecure_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, dir) = fixture();
+    std::fs::set_permissions(
+        temp.path().join("private"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(matches!(
+        dir.sync_all(),
+        Err(Error::InsecurePermissions { .. })
+    ));
+}
+
+#[test]
 fn native_names_round_trip_through_enumeration() {
     let (_temp, dir) = fixture();
     #[cfg(all(unix, not(target_os = "macos")))]

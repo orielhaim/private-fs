@@ -343,7 +343,7 @@ impl AtomicFile {
         self.checkpoint(FaultPoint::AfterPublishedValidate)?;
         if self.durability == Durability::Full {
             self.checkpoint(FaultPoint::BeforeParentSync)?;
-            self.parent.sync_parent(self.durability)?;
+            self.parent.sync_all()?;
             self.checkpoint(FaultPoint::AfterParentSync)?;
         }
         self.checkpoint(FaultPoint::BeforeFinalValidate)?;

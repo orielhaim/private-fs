@@ -105,7 +105,13 @@ Durability is explicit:
 | --- | --- |
 | `write_atomic` | no explicit sync |
 | `Data` | sync file data before publication |
-| `write_atomic_durable` | sync file, publish, sync parent |
+| `write_atomic_durable` | sync file, publish, then `PrivateDir::sync_all` |
+
+`PrivateDir::sync_all` flushes the retained directory itself, including namespace
+changes the filesystem reports for that directory. It does not sync file contents,
+nested directories, or the name of this directory in its parent. It is not a
+transaction and does not prove that a deletion occurred. On Windows a removal can
+stay pending while other handles remain open.
 
 `atomic_with_policy(path, durability, Publication::CreateNew)` fails atomically if
 any destination exists. NetBSD explicitly rejects this optional policy.

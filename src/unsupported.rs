@@ -46,6 +46,9 @@ impl PrivateDir {
     pub fn ensure_dir(&self, _: impl AsRef<Path>) -> Result<Self> {
         unsupported()
     }
+    pub fn sync_all(&self) -> Result<()> {
+        unsupported()
+    }
 }
 fn unsupported<T>() -> Result<T> {
     Err(Error::UnsupportedFilesystem {

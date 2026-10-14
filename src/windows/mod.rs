@@ -224,7 +224,7 @@ impl PrivateDir {
             may_have_removed = true;
             drop(handle);
             if durability == Durability::Full {
-                parent.sync_parent(durability)?;
+                parent.sync_all()?;
             }
             parent.check_private()
         })();
@@ -374,7 +374,7 @@ impl PrivateDir {
         temp.verify()?;
         nt::delete(&temp.file)
     }
-    pub(crate) fn sync_parent(&self, _durability: crate::Durability) -> Result<()> {
+    pub fn sync_all(&self) -> Result<()> {
         self.check_private()?;
         let writable = nt::directory_for_sync(&self.handle)?;
         nt::validate(&writable, true, Some(self.id), &self.user)?;

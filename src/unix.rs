@@ -566,7 +566,7 @@ impl PrivateDir {
             }
             may_have_removed = true;
             if durability == Durability::Full {
-                parent.sync_parent(durability)?;
+                parent.sync_all()?;
             }
             parent.check_private()
         })();
@@ -813,7 +813,7 @@ impl PrivateDir {
         }
         Ok(()) // The last descriptor closes the anonymous inode automatically.
     }
-    pub(crate) fn sync_parent(&self, _durability: crate::Durability) -> Result<()> {
+    pub fn sync_all(&self) -> Result<()> {
         self.check_private()?;
         fs::fsync(&self.fd)?;
         #[cfg(target_os = "macos")]
