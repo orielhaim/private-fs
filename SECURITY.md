@@ -67,8 +67,8 @@ Do not give an untrusted same-principal actor write access to a private tree.
   syscall fallback exists. The running kernel must include the
   [FreeBSD-SA-26:42.unlinkat fix](https://www.freebsd.org/security/advisories/FreeBSD-SA-26:42.unlinkat.asc),
   shipped in 15.1-RELEASE-p1. A non-destructive directory probe verifies that
-  `funlinkat` rejects escape. The release floor and probe do not establish that
-  every unrelated security patch is installed; keep the operating system patched.
+  `funlinkat` rejects escape. That probe does not establish that every unrelated
+  security patch is installed; keep the operating system patched.
   NetBSD uses retained descriptors and nofollow component traversal.
 - BSD immutable, append-only, and no-unlink flags do not weaken privacy checks.
   The library does not reject harmless flags or clear them implicitly. Native

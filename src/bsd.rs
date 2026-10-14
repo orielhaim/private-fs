@@ -150,7 +150,6 @@ fn option(fd: impl AsFd, name: i32) -> Result<bool> {
     }
 }
 fn model(fd: impl AsFd) -> Result<Option<i32>> {
-    supported_kernel()?;
     match (
         option(fd.as_fd(), libc::_PC_ACL_EXTENDED)?,
         option(fd, PC_NFS4)?,
@@ -191,43 +190,6 @@ pub(super) fn verify(fd: impl AsFd, directory: bool) -> Result<()> {
         if directory && kind == ACCESS {
             Acl::get(fd, DEFAULT)?.empty()?;
         }
-    }
-    Ok(())
-}
-
-fn supported_kernel() -> Result<()> {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SUPPORTED.get_or_init(|| {
-        let mut system = std::mem::MaybeUninit::<libc::utsname>::uninit();
-        // SAFETY: uname initializes the complete structure on success.
-        if unsafe { libc::uname(system.as_mut_ptr()) } != 0 {
-            return false;
-        }
-        // SAFETY: successful uname supplies a NUL-terminated release field.
-        let system = unsafe { system.assume_init() };
-        let release = unsafe { std::ffi::CStr::from_ptr(system.release.as_ptr()) };
-        let Ok(release) = release.to_str() else {
-            return false;
-        };
-        let mut version = release.split(['.', '-']);
-        let Some(major) = version.next().and_then(|v| v.parse::<u32>().ok()) else {
-            return false;
-        };
-        let Some(minor) = version.next().and_then(|v| v.parse::<u32>().ok()) else {
-            return false;
-        };
-        #[cfg(target_os = "freebsd")]
-        {
-            (major, minor) >= (15, 1)
-        }
-        #[cfg(target_os = "netbsd")]
-        {
-            (major, minor) >= (11, 0)
-        }
-    }) {
-        return Err(Error::UnsupportedFilesystem {
-            capability: "supported BSD kernel release",
-        });
     }
     Ok(())
 }
